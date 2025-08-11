@@ -65,6 +65,8 @@ async def main() -> None:
 
             ## Available tools
             • `resolve_stock_id_mssql(keyword: str)` — Resolve a company name/abbr/listCode to an internal stock id.
+                - If no match is found, politely ask the user for clarification before continuing.
+                - If a match is found, proceed with the next steps without asking for clarification.
             • `read_schema_csv(file: str | None)` — Read the `stTseStkPrcD_schema.csv` (column names & meanings for daily prices table).
             • `query_sql_mssql(sql: str, limit: int=500)` — Run **read-only** T-SQL (SELECT/WITH only) against SQL Server; auto-limits large results.
             • `add(a: int, b: int)` / `multiply(a: int, b: int)` — Basic arithmetic only (no other math ops).
@@ -73,6 +75,7 @@ async def main() -> None:
             1) Identify the data
             • When a user mentions a company name / abbreviation / listCode (e.g., 台積電, 2330), first call **`resolve_stock_id_mssql`** with the raw text.
             • If no match is found, politely ask for clarification.
+            • If a match is found, proceed directly with the next steps — do not ask the user for confirmation or clarification.
 
             2) Query column definitions
             • Call **`read_schema_csv`** to load `stTseStkPrcD_schema.csv`.
@@ -140,24 +143,10 @@ async def main() -> None:
 
     # Add the assistant to the agent chat
     def extract_text(chat_message) -> str:
-        """
-        Normalize Autogen's message into displayable text.
-        Handles:
-        - plain string
-        - list of TextContent objects (with .text)
-        - list of dict parts ({'type': 'text', 'text': '...'})
-        - dict payloads that include 'markdown' or 'text'
-        """
-        if chat_message is None:
-            return ""
-
+        # (your existing normalizer — unchanged)
         parts = getattr(chat_message, "content", None)
-
-        # plain string
         if isinstance(parts, str):
             return parts
-
-        # list of parts (TextContent / dict / str)
         if isinstance(parts, list):
             out = []
             for p in parts:
@@ -168,22 +157,39 @@ async def main() -> None:
                 elif isinstance(p, str):
                     out.append(p)
             return "\n".join(t for t in out if t)
-
-        # dict payload (sometimes tools return structured fields)
         if isinstance(parts, dict):
             if isinstance(parts.get("markdown"), str):
                 return parts["markdown"]
             if isinstance(parts.get("text"), str):
                 return parts["text"]
-
-        # last resort
         return "" if parts is None else str(parts)
 
+    def needs_continuation(text: str) -> bool:
+        """
+        Heuristics: return True if the assistant is narrating 'next I'll do X'
+        instead of giving the final result (no table / no bullet list yet).
+        """
+        if not text:
+            return True
+        t = text.strip()
+        # Has markdown table?
+        if "|" in t and "---" in t:
+            return False
+        # Has a bullet-list style final output?
+        if any(prefix in t for prefix in ["- 股票：", "• 股票：", "— 股票："]):
+            return False
+        # Looks like 'I will … please wait/ok'?
+        cues = ["接下來我會", "我將查詢", "請稍候", "請稍等", "是否繼續", "ok?"]
+        return any(cue in t for cue in cues)
 
+    async def ask_assistant(messages):
+        token = CancellationToken()
+        return await assistant.on_messages(messages, cancellation_token=token)
+
+    
     print("=== Autogen Assistant Ready ===")
-    print("Type your query below. Type 'exit' to quit.\n")
-
-    # ---- Main REPL loop (paste this whole block) ----
+    print("Type your query below. Press exit to exit.\n")
+    # ---- Main REPL loop ----
     while True:
         try:
             user_input = input(">>> ")
@@ -195,20 +201,25 @@ async def main() -> None:
             print("👋 Exiting. Goodbye!")
             break
 
-        token = CancellationToken()
-        try:
-            response = await assistant.on_messages(
-                [TextMessage(content=user_input, source="user")],
-                cancellation_token=token
-            )
-        except Exception as e:
-            print(f"\n❌ Request failed: {e}\n")
-            continue
-
-        # Use the normalizer instead of printing the raw object repr
+        # 1) Send the user's message
+        response = await ask_assistant([TextMessage(content=user_input, source="user")])
         text = extract_text(getattr(response, "chat_message", None))
+
+        # 2) If it looks like a mid-task narration, auto-continue (no user 'ok')
+        max_auto_steps = 3
+        auto_steps = 0
+        while needs_continuation(text) and auto_steps < max_auto_steps:
+            auto_steps += 1
+            # Strong nudge to finish in the SAME turn
+            nudge = (
+                "不要詢問確認，直接完成所有需要的工具調用，並在同一則回覆中輸出最終結果。"
+                "請輸出最終答案（表格或條列），不要再描述接下來要做什麼。"
+            )
+            response = await ask_assistant([TextMessage(content=nudge, source="system")])
+            text = extract_text(getattr(response, "chat_message", None))
+
         if text.strip():
-            print(f"\n💬 Assistant: {text}\n")
+            print(f"\n💬 Assistant: \n{text}\n")
         else:
             print("\n⚠️ No text content in response.\n")
 
