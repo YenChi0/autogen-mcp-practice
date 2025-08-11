@@ -2,10 +2,11 @@ import asyncio
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-
+from autogen_agentchat.messages import TextMessage
+from autogen_core import CancellationToken
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
-from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
+from autogen_agentchat.agents import AssistantAgent
 
 # Load .env credentials
 load_dotenv()
@@ -29,6 +30,14 @@ async def main() -> None:
     mssql_tools = await mcp_server_tools(mssql_server)
     all_tools = math_tools + mssql_tools
 
+    # for t in all_tools:
+    #     # `t.schema` is usually a dict with name/description/parameters
+    #     try:
+    #         print(t.schema["function"]["name"], "→", t.schema["function"]["description"])
+    #         print(t.schema["function"]["parameters"])
+    #     except Exception:
+    #         print(getattr(t, "schema", t))
+
     # Azure OpenAI client
     model_client = AzureOpenAIChatCompletionClient(
         model=model_name,
@@ -38,6 +47,8 @@ async def main() -> None:
         api_key=api_key,
     )
 
+
+
     # Assistant agent
     assistant = AssistantAgent(
         name="financial_assistant",
@@ -45,10 +56,75 @@ async def main() -> None:
         tools=all_tools,
         reflect_on_tool_use=True,
         system_message=(
-            "You are a financial assistant specializing in stock market analysis and data interpretation. "
-            "Use 'mssql_tool' to query SQL Server for real financial data. "
-            "Use 'math_tool' to calculate averages, ratios, or percentages from data. "
-            "Always base answers on tool results. Keep answers short and data-driven."
+            """
+            You are a **bilingual (繁體中文 / English) financial-data assistant** connected to a Microsoft SQL Server data-warehouse.
+            Current calendar date (Asia/Taipei): {today_taipei}
+
+            ## Your mission
+            • Help users explore Taiwanese equities: prices, volumes, market value, and related metrics.
+
+            ## Available tools
+            • `resolve_stock_id_mssql(keyword: str)` — Resolve a company name/abbr/listCode to an internal stock id.
+            • `read_schema_csv(file: str | None)` — Read the `stTseStkPrcD_schema.csv` (column names & meanings for daily prices table).
+            • `query_sql_mssql(sql: str, limit: int=500)` — Run **read-only** T-SQL (SELECT/WITH only) against SQL Server; auto-limits large results.
+            • `add(a: int, b: int)` / `multiply(a: int, b: int)` — Basic arithmetic only (no other math ops).
+
+            ## Workflow you MUST follow
+            1) Identify the data
+            • When a user mentions a company name / abbreviation / listCode (e.g., 台積電, 2330), first call **`resolve_stock_id_mssql`** with the raw text.
+            • If no match is found, politely ask for clarification.
+
+            2) Query column definitions
+            • Call **`read_schema_csv`** to load `stTseStkPrcD_schema.csv`.
+            • This describes the columns for **`stTseStkPrcD`** (daily stock prices & market data). Use it to choose the right fields.
+
+            3) Query market data
+            • Use **`query_sql_mssql`** to read from **`stTseStkPrcD`**.
+            • SQL must be **read-only**: **SELECT / WITH only** (never INSERT/UPDATE/DELETE).
+            • Column names are case-sensitive; wrap identifiers containing capitals in **square brackets**, e.g. `[AskPrice1]`, `[MktDate]`.
+            • Keep result sets small:
+                – Prefer aggregation when appropriate, and
+                – Limit rows to **≤ 500** using **either**:
+                    * `TOP(n)`  
+                    * `ORDER BY … OFFSET … FETCH NEXT n ROWS ONLY`  
+                **Never use TOP and OFFSET … FETCH in the same query.**
+            • If you need arithmetic beyond SQL expressions, you may call **`add`** or **`multiply`** (only those two).
+
+            4) Explain & format
+            • When presenting a stock, always prefix with 4-digit id and a representative alias, e.g., **“2330 台積電”**.
+            • For numeric answers, include the figure **and** its unit (e.g., “成交量 23 萬張”, “市值 12 兆元”).
+            • Be crisp and data-driven; show calculations when helpful; reply in Chinese or English to match the user.
+            
+
+            5) OUTPUT RULES — VERY IMPORTANT
+            • Use as many tools as needed; do not print intermediate outputs.
+            • Speak once with the **final answer only**.
+            • If multiple rows → render a Markdown table with headers.
+            • If exactly one row → render a compact bullet list.
+            • Numbers use thousands separators; dates: YYYY-MM-DD.
+            • Numbers: use thousands separators; for volumes add '張' or '股' only if provided by data; otherwise keep raw numbers.
+            
+            Dates: YYYY-MM-DD.
+            TABLE HEADER EXAMPLE (OHLCV):
+            | 股票 | 日期 | 開盤 | 高 | 低 | 收 | 成交量 |
+
+            SINGLE-ROW LIST EXAMPLE:
+            - 股票：0001 台灣水泥
+            - 日期：2025-08-08
+            - 開盤：24.35
+            - 最高：24.60
+            - 最低：24.10
+            - 收盤：24.50
+            - 成交量：12,345
+
+            ## Safety & etiquette
+            • **Never** guess an id — always rely on `resolve_stock_id_mssql`.
+            • **Never** modify data (no INSERT/UPDATE/DELETE).
+            • If a query would return too many rows, aggregate or restrict with `TOP` / `OFFSET … FETCH`.
+            • **Never** use TOP and OFFSET … FETCH in the same query.
+            • If data is missing or no rows are returned, say so and suggest a practical alternative (e.g., previous close, recent average).
+            • Always ground answers in actual tool outputs; do not fabricate values.
+            """
         )
     )
     # Async input function for UserProxyAgent
@@ -62,29 +138,80 @@ async def main() -> None:
     #     input_func=async_input_func
     # )
 
+    # Add the assistant to the agent chat
+    def extract_text(chat_message) -> str:
+        """
+        Normalize Autogen's message into displayable text.
+        Handles:
+        - plain string
+        - list of TextContent objects (with .text)
+        - list of dict parts ({'type': 'text', 'text': '...'})
+        - dict payloads that include 'markdown' or 'text'
+        """
+        if chat_message is None:
+            return ""
+
+        parts = getattr(chat_message, "content", None)
+
+        # plain string
+        if isinstance(parts, str):
+            return parts
+
+        # list of parts (TextContent / dict / str)
+        if isinstance(parts, list):
+            out = []
+            for p in parts:
+                if hasattr(p, "text") and isinstance(p.text, str):
+                    out.append(p.text)
+                elif isinstance(p, dict) and isinstance(p.get("text"), str):
+                    out.append(p["text"])
+                elif isinstance(p, str):
+                    out.append(p)
+            return "\n".join(t for t in out if t)
+
+        # dict payload (sometimes tools return structured fields)
+        if isinstance(parts, dict):
+            if isinstance(parts.get("markdown"), str):
+                return parts["markdown"]
+            if isinstance(parts.get("text"), str):
+                return parts["text"]
+
+        # last resort
+        return "" if parts is None else str(parts)
+
+
     print("=== Autogen Assistant Ready ===")
     print("Type your query below. Type 'exit' to quit.\n")
 
+    # ---- Main REPL loop (paste this whole block) ----
     while True:
-        user_input = input(">>> ")
+        try:
+            user_input = input(">>> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Exiting. Goodbye!")
+            break
+
         if user_input.strip().lower() == "exit":
             print("👋 Exiting. Goodbye!")
             break
 
-        from autogen_agentchat.messages import TextMessage
-        from autogen_core import CancellationToken
-
         token = CancellationToken()
+        try:
+            response = await assistant.on_messages(
+                [TextMessage(content=user_input, source="user")],
+                cancellation_token=token
+            )
+        except Exception as e:
+            print(f"\n❌ Request failed: {e}\n")
+            continue
 
-        response = await assistant.on_messages(
-            [TextMessage(content=user_input, source="user")],
-            cancellation_token=token
-        )
-
-        if hasattr(response.chat_message, "content"):
-            print(f"\n💬 Assistant: {response.chat_message.content}\n")
+        # Use the normalizer instead of printing the raw object repr
+        text = extract_text(getattr(response, "chat_message", None))
+        if text.strip():
+            print(f"\n💬 Assistant: {text}\n")
         else:
-            print("\n⚠️ Assistant did not return a valid message.\n")
+            print("\n⚠️ No text content in response.\n")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
