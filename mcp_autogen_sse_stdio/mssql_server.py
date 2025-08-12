@@ -11,7 +11,7 @@ import csv
 from pathlib import Path
 import asyncio, os
 from typing import Any, Dict, List
-
+import sys, traceback, re
 import aioodbc
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -61,7 +61,7 @@ async def query_sql_mssql(sql: str, limit: int = 500) -> List[Dict[str, Any]] | 
     }
 
     """
-    import sys, traceback, re
+    
 
     # Basic guard
     low = sql.strip().lower()
