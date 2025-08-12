@@ -8,6 +8,8 @@ from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 from autogen_agentchat.teams import SelectorGroupChat
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_agentchat.ui import Console
+from datetime import datetime, timezone, timedelta
+today_taipei = datetime.now(timezone(timedelta(hours=8))).date()
 
 # ---------- Env ----------
 load_dotenv()
@@ -49,23 +51,34 @@ async def main() -> None:
     )
 )
     # 2) The tool user: does all resolving + schema + SQL work. No chit-chat.
-    sql_agent = AssistantAgent(
-        name="SQL_Agent",
+    mssql_agent = AssistantAgent(
+        name="MSSQL_Agent",
         model_client=model_client,
-        tools=mssql_tools,  # give it everything it might need
+        tools=mssql_tools,  
         reflect_on_tool_use=True,
         tool_call_summary_format="{tool_name}({arguments}) -> {result}",  # ← human-readable trace,
         model_client_stream=True,
         system_message=(
-            "You are SQL_Agent. Role: find stock id, read schema, and query stTseStkPrcD.\n"
-            "Rules:\n"
-            "1) If user mentions a company/listCode, FIRST call resolve_stock_id_mssql(raw text).\n"
-            "2) If match found -> proceed. If not -> clearly state no match and STOP.\n"
-            "3) Call read_schema_csv('stTseStkPrcD_schema.csv') to know columns.\n"
-            "4) Use query_sql_mssql with SELECT/WITH only; keep rows small via TOP or OFFSET…FETCH (not both).\n"
-            "5) Do NOT format the final table/answer. Leave final formatting to Reporter."
-        ),
-        description="Finds stock id, inspects schema, and runs read-only SQL to gather data."
+            f"""
+                You are MSSQL_Agent — a **bilingual (繁體中文 / English) financial-data assistant** connected to a Microsoft SQL Server data warehouse, specializing in Taiwanese stock fundamentals and prices.  
+                Current calendar date (Asia/Taipei): {today_taipei}
+
+                Rules:
+                1) If the user mentions a company name or market id/listCode, first translate it to an internal stock id using `resolve_stock_id_mssql`.
+                2) If the user mentions an industry, resolve it using `resolve_stock_industry`.
+                3) If match found → proceed. If not → clearly state no match and STOP.
+                4) Call read_schema_csv('stTseStkPrcD_schema.csv') before query_sql_mssql to know table columns.
+                5) Use query_sql_mssql with SELECT/WITH only; keep rows small via TOP or OFFSET…FETCH (not both).
+                6) NEVER execute INSERT/UPDATE/DELETE.
+                7) If a query would return more than 500 rows, aggregate or LIMIT 100.
+                8) If a user requests data from a month or year, always query the full month/year, not just a single date.
+                9) If data is unavailable, say so and suggest an alternative metric.
+                10) Before giving the output, always check the unit of each column in stTseStkPrcD_schema.csv.
+                11) Do NOT format the final table/answer — leave final formatting to the Reporter.
+                12) Remember to always include the column unit in the final output.
+            """
+            ),
+            description="Finds stock id, inspects schema, and runs read-only SQL to gather data."
     )
 
     # 3) (Optional) explicit math specialist – kept for completeness
@@ -73,8 +86,7 @@ async def main() -> None:
         name="Math_Agent",
         model_client=model_client,
         tools=math_tools,
-        reflect_on_tool_use=True,
-        tool_call_summary_format="{tool_name}({arguments}) -> {result}",
+        reflect_on_tool_use=False,
         model_client_stream=True,
         system_message=(
             "You are Math_Agent. Perform small arithmetic ONLY when asked by SQL_Agent or Reporter. "
@@ -88,8 +100,7 @@ async def main() -> None:
         name="Reporter",
         model_client=model_client,
         tools=[],  # no tools; just format the end result
-        reflect_on_tool_use=True,
-        tool_call_summary_format="{tool_name}({arguments}) -> {result}",
+        reflect_on_tool_use=False,
         model_client_stream=True,
         system_message=(
             "You are Reporter. Produce the FINAL answer only, in 繁體中文 or English to match the user.\n"
@@ -101,6 +112,7 @@ async def main() -> None:
             "Do not display columns with no results\n"
             "- Thousands separators for numbers, dates as YYYY-MM-DD.\n"
             "Do NOT ask confirmation. Do NOT describe steps. Output once.\n"
+            "Remember to always include the column unit in the final output.\n"
             "After you output the final answer, append a new line with: TERMINATE"
         ),
         description="Formats and emits the final one-shot answer."
@@ -114,8 +126,8 @@ async def main() -> None:
         "{history}\n\n"
         "Select an agent from: {participants}\n\n"
         "Following is the rule to choose an agent:\n"
-        "- When the task involves Taiwanese stocks or SQL, prefer SQL_Agent.\n"
-        "- Choose SQL_Agent for stock id resolution, schema inspection, and SQL queries.\n"
+        "- When the task involves Taiwanese stocks, Market stocks, Industry stocks or SQL, prefer MSSQL_Agent.\n"
+        "- Choose MSSQL_Agent for stock id resolution, schema inspection, and SQL queries.\n"
         "- Choose Math_Agent only when explicit arithmetic is needed.\n"
         "- Only select 'User' if the latest assistant message includes 'REQUEST_USER_INPUT'.\n"
         "- Avoid unnecessary switching; allow the same speaker to continue if still working.\n"
@@ -123,7 +135,7 @@ async def main() -> None:
     )
 
     team = SelectorGroupChat(
-        participants=[user_agent, sql_agent, math_agent, reporter],
+        participants=[user_agent, mssql_agent, math_agent, reporter],
         model_client=model_client,
         termination_condition=TextMentionTermination("TERMINATE"),
         selector_prompt=selector_prompt,
