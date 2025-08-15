@@ -37,6 +37,157 @@ async def get_pool() -> aioodbc.pool.Pool:
         )
     return _pool
 
+# top_metric_mssql : Get top-N metrics for a stock within a date range
+@mcp.tool()
+async def top_metric_mssql(
+    stock_id: int,
+    metric: str,
+    start_date: str,
+    end_date: str,
+    top_n: int = 1,
+    order_dir: str = "DESC",
+    latest_only: bool = False
+) -> list[dict]:
+    """
+    Return top-N rows for a given metric within a date window for one stock.
+    If latest_only=True, first lock to the latest trading day within the window,
+    then rank within that day; else rank across the whole window.
+
+    description :
+    Return the top-N rows for a given stock and metric over a date window.
+    Optionally set latest_only=true to first lock to the latest trading day inside the window, then rank on that day.
+
+    Dates: YYYY-MM-DD (half-open interval [start_date, end_date); end is exclusive).
+
+    Metrics:
+
+    txnValue = 成交金額
+
+    txnShares = 成交量
+
+    salePrice = 收盤價
+
+    Ordering: DESC (最大在前) or ASC (最小在前).
+
+    Read-only: Internally builds a safe SELECT against dbo.stTseStkPrcD and dbo.stScuSecuBasC.
+
+    Returns an array of rows with: trading_date, metric_value, stock_name, listCode.
+
+    Parameters :
+    {
+        "type": "object",
+        "properties": {
+            "stock_id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Internal stock ID (stScuSecuBasC.id / p.stScuSecuBasC_id). Example: 9722."
+            },
+            "metric": {
+            "type": "string",
+            "enum": ["txnValue", "txnShares", "salePrice"],
+            "description": "Column to rank by: txnValue=成交金額, txnShares=成交量, salePrice=收盤價."
+            },
+            "start_date": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Inclusive start date (YYYY-MM-DD)."
+            },
+            "end_date": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Exclusive end date (YYYY-MM-DD). Must be later than start_date."
+            },
+            "top_n": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 1,
+            "description": "Number of rows to return after sorting."
+            },
+            "order_dir": {
+            "type": "string",
+            "enum": ["ASC", "DESC"],
+            "default": "DESC",
+            "description": "Sort direction for the metric (DESC = largest first)."
+            },
+            "latest_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, first lock to the latest trading date within [start_date, end_date) for this stock, then rank on that day."
+            }
+        },
+        "required": ["stock_id", "metric", "start_date", "end_date"]
+    }
+
+    example :
+    {
+        "stock_id": 9722,
+        "metric": "txnShares",
+        "start_date": "2025-07-01",
+        "end_date": "2025-08-01",
+        "top_n": 3,
+        "order_dir": "DESC",
+        "latest_only": false
+    }
+    
+    """
+    # ---- whitelist ----
+    METRIC_MAP = {
+        "txnValue": "txnValue",
+        "txnShares": "txnShares",
+        "salePrice": "salePrice",
+        # add others you actually store
+    }
+    if metric not in METRIC_MAP:
+        raise ValueError("Unsupported metric")
+    col = METRIC_MAP[metric]
+
+    order = "DESC" if str(order_dir).upper() == "DESC" else "ASC"
+    n = int(top_n)
+    sid = int(stock_id)
+
+    if latest_only:
+        sql = f"""
+            WITH D AS (
+            SELECT MAX(ymdOn) AS d
+            FROM dbo.stTseStkPrcD
+            WHERE stScuSecuBasC_id = {sid}
+                AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
+            )
+            SELECT TOP ({n})
+            p.ymdOn AS trading_date,
+            p.{col} AS metric_value,
+            s.name  AS stock_name,
+            s.listCode
+            FROM dbo.stTseStkPrcD p
+            JOIN dbo.stScuSecuBasC s ON p.stScuSecuBasC_id = s.id
+            WHERE p.stScuSecuBasC_id = {sid}
+            AND p.ymdOn = (SELECT d FROM D)
+            ORDER BY p.{col} {order}, p.ymdOn DESC
+            """.strip()
+    else:
+        sql = f"""
+            SELECT TOP ({n})
+            p.ymdOn AS trading_date,
+            p.{col} AS metric_value,
+            s.name  AS stock_name,
+            s.listCode
+            FROM dbo.stTseStkPrcD p
+            JOIN dbo.stScuSecuBasC s ON p.stScuSecuBasC_id = s.id
+            WHERE p.stScuSecuBasC_id = {sid}
+            AND p.ymdOn >= '{start_date}' AND p.ymdOn < '{end_date}'
+            ORDER BY p.{col} {order}, p.ymdOn DESC
+            """.strip()
+
+    # Reuse your pool + execution path (same as query_sql_mssql)
+    pool = await get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(sql)
+        cols = [c[0] for c in cur.description]
+        rows = await cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+
 # query_sql_mssql : input is a raw SQL string, output is a list of dicts from the result set.
 @mcp.tool()
 async def query_sql_mssql(sql: str, limit: int = 500) -> List[Dict[str, Any]] | Dict[str, str]:
@@ -70,7 +221,10 @@ async def query_sql_mssql(sql: str, limit: int = 500) -> List[Dict[str, Any]] | 
 
     """
     
-    low = sql.strip().lower()
+    low_src = sql.strip()
+    sql = re.sub(r";+\s*$", "", low_src, flags=re.S)
+    low = sql.lower()
+    
     if not low.startswith(("select", "with")):
         raise ValueError("Only SELECT / WITH statements are allowed")
 
@@ -96,6 +250,12 @@ async def query_sql_mssql(sql: str, limit: int = 500) -> List[Dict[str, Any]] | 
 
         pool = await get_pool()
         async with pool.acquire() as conn, conn.cursor() as cur:
+            # set per-statement timeout (seconds) BEFORE running the query
+            try:
+                conn.timeout = 30
+            except Exception:
+                pass
+
             await cur.execute(sql)
             cols = [c[0] for c in cur.description]
             rows = await cur.fetchall()
@@ -150,6 +310,7 @@ async def read_schema_csv(file: str | None = None) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 # resolve_stock_id_mssql : input is a keyword string, output is a dict with the stock ID and matched column/value.
 # it compares stock id first by exact listCode match, then by LIKE search across multiple alias columns.
+# Maps a user keyword (公司名 / 簡稱 / listCode) to the internal stock id in stScuSecuBasC.
 @mcp.tool()
 async def resolve_stock_id_mssql(keyword: str) -> Dict[str, Any]:
     """
@@ -236,6 +397,7 @@ async def resolve_stock_id_mssql(keyword: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 🔁  Resolve stock name from internal id  -----------------------------------
 # ---------------------------------------------------------------------------
+# resolve_stock_name_mssql : Given an internal `id`, return the primary company name from stock.dbo.stScuSecuBasC (`name` column). Also returns listCode.
 @mcp.tool()
 async def resolve_stock_name_mssql(stock_id: int | str) -> Dict[str, Any]:
     """
@@ -295,6 +457,7 @@ async def resolve_stock_name_mssql(stock_id: int | str) -> Dict[str, Any]:
 # 🔎  Resolve industry id from name / Eng / Abbr  (returns market 1 and 2)
 # ---------------------------------------------------------------------------
 # resolve_stock_industry : Translate an industry keyword to its internal `id` from misc.dbo.mtIndustryC.
+# given industry keyword, return its internal id for both markets.
 @mcp.tool()
 async def resolve_stock_industry(keyword: str) -> dict[str, Any]:
     """
@@ -372,15 +535,13 @@ async def resolve_stock_industry(keyword: str) -> dict[str, Any]:
 # 🗂️  List all stocks in an industry  ----------------------------------------
 # ---------------------------------------------------------------------------
 # list_stocks_by_industry : query company stocks by industry_id
+# given an 上市產業ID or 上櫃產業ID, return all matching stocks from **stock.dbo.stScuSecuBasC**.
 @mcp.tool()
-async def list_stocks_by_industry(industry_id: int) -> list[dict[str, Any]]:
+async def list_stocks_by_industry(industry_id: int) -> list[int]:
     """
-    Given an `industry_id` ( = mtIndustryC_id ),
-    return all matching stocks from **stock.dbo.stScuSecuBasC**.
+    Given an `industry_id` (= mtIndustryC_id), return a list of internal stock IDs.
 
-    Each row -> {"id": 748, "listCode": "2330", "nameAbbrV2": "台積電"}
-
-    "description": "Return all stocks (id, listCode, nameAbbrV2) that belong to a given industry_id using stock.dbo.stScuSecuBasC.",
+    "description": "Return all stocks id that belong to a given industry_id using stock.dbo.stScuSecuBasC.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -397,16 +558,16 @@ async def list_stocks_by_industry(industry_id: int) -> list[dict[str, Any]]:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT id, listCode, nameAbbrV2
+            SELECT id
             FROM   stock.dbo.stScuSecuBasC
             WHERE  mtIndustryC_id = ?
             ORDER  BY id
             """,
             (industry_id,),
         )
-        cols = [c[0] for c in cur.description]      # ["id", "listCode", …]
         rows = await cur.fetchall()
-        return [dict(zip(cols, r)) for r in rows]
+        return [int(r[0]) for r in rows]
+
 
 # ── BOOT ──────────────────────────────────────────────────────────────
 async def run() -> None:

@@ -64,18 +64,44 @@ async def main() -> None:
                 Current calendar date (Asia/Taipei): {today_taipei}
 
                 Rules:
-                1) If the user mentions a company name or market id/listCode, first translate it to an internal stock id using `resolve_stock_id_mssql`.
-                2) If the user mentions an industry, resolve it using `resolve_stock_industry`.
-                3) If match found → proceed. If not → clearly state no match and STOP.
-                4) Call read_schema_csv('stTseStkPrcD_schema.csv') before query_sql_mssql to know table columns.
-                5) Use query_sql_mssql with SELECT/WITH only; keep rows small via TOP or OFFSET…FETCH (not both).
-                6) NEVER execute INSERT/UPDATE/DELETE.
-                7) If a query would return more than 500 rows, aggregate or LIMIT 100.
-                8) If a user requests data from a month or year, always query the full month/year, not just a single date.
-                9) If data is unavailable, say so and suggest an alternative metric.
-                10) Before giving the output, always check the unit of each column in stTseStkPrcD_schema.csv.
-                11) Do NOT format the final table/answer — leave final formatting to the Reporter.
-                12) Remember to always include the column unit in the final output.
+                You are a no-chatter SQL tool user. Follow these rules exactly:
+
+                ID RESOLUTION
+                1) If the user mentions a company name or market id/listCode → call resolve_stock_id_mssql.
+                2) If the user mentions an industry → call resolve_stock_industry, then list_stocks_by_industry.
+                3) If a lookup has NO match → say so and suggest alternatives (e.g., "Try a different name or industry").
+
+                SCHEMA & COLUMNS
+                4) Before any query to dbo.stTseStkPrcD → call read_schema_csv('stTseStkPrcD_schema.csv') to know columns/units.
+                5) When querying stTseStkPrcD, filter/join by stScuSecuBasC_id (internal stock id).
+                6) If need to query the highest or lowest value of any indicator, use top_metric_mssql
+                6) Use ymdOn as the trading date column (rename here if your real column differs).
+
+                LIMITS & SAFETY
+                7) Only read queries. NEVER INSERT/UPDATE/DELETE.
+                8) DEFAULT LIMIT: TOP (100). Never return >100 rows.
+                9) Prefer TOP (N). Use OFFSET…FETCH only if strictly needed (and never mix it with TOP).
+
+                DATE WINDOWS & RANKS
+                10) If user didn’t specify a date/period and the task needs ranking (e.g., most traded, top gainers/losers):
+                    WITH D AS (SELECT MAX(ymdOn) AS d FROM dbo.stTseStkPrcD)
+                    SELECT ...
+                    FROM dbo.stTseStkPrcD AS p
+                    CROSS JOIN D
+                    WHERE p.ymdOn = D.d
+                    ORDER BY ...
+                11) Never sort an unbounded history; always limit by date or a clear window.
+                12) If the user asks for a month/year, query the FULL month/year (not a single day).
+
+                MANY IDS
+                13) If filtering many ids, split into chunks of ≤30 and UNION ALL; apply final TOP (N) on the combined set.
+
+                OUTPUT RULES
+                14) Always include stock name and its listCode from stScuSecuBasC.
+                15) Always include column UNITS from stTseStkPrcD_schema.csv.
+                16) Do NOT format the final table/answer—leave that to the Reporter.
+                17) If data is unavailable, say so and suggest an alternative metric.
+
             """
             ),
             description="Finds stock id, inspects schema, and runs read-only SQL to gather data."
@@ -106,13 +132,14 @@ async def main() -> None:
             "You are Reporter. Produce the FINAL answer only, in 繁體中文 or English to match the user.\n"
             "Formatting rules:\n"
             "- If multiple rows → Markdown table with headers.\n"
-            "- If the SQL output contains exactly one row, present it as a compact bullet list using the available columns in this order when present: 股票, column, column, column, column, column, column (add units only for columns that have them). \n"
+            "- If the SQL output contains exactly one row, present it as a compact bullet list using the available columns in this order when present: 股票ID, 股票名稱, column, column, column, column, column, column (add units only for columns that have them). \n"
             "The stock name must be displayed\n"
             "Do not create or infer any columns that are not present in the SQL output\n"
             "Do not display columns with no results\n"
             "- Thousands separators for numbers, dates as YYYY-MM-DD.\n"
             "Do NOT ask confirmation. Do NOT describe steps. Output once.\n"
             "Remember to always include the column unit in the final output.\n"
+            "Always include stock name in the output and its list code from stScuSecuBasC.\n"
             "After you output the final answer, append a new line with: TERMINATE"
         ),
         description="Formats and emits the final one-shot answer."
@@ -129,8 +156,10 @@ async def main() -> None:
         "- When the task involves Taiwanese stocks, Market stocks, Industry stocks or SQL, prefer MSSQL_Agent.\n"
         "- Choose MSSQL_Agent for stock id resolution, schema inspection, and SQL queries.\n"
         "- Choose Math_Agent only when explicit arithmetic is needed.\n"
-        "- Only select 'User' if the latest assistant message includes 'REQUEST_USER_INPUT'.\n"
+        "- Select 'User' if the assistant message includes 'REQUEST_USER_INPUT'.\n"
         "- Avoid unnecessary switching; allow the same speaker to continue if still working.\n"
+        "Please give more time to search because there is a lot of information in mssql.\n"
+        "Always include stock name in the output and its list code from stScuSecuBasC.\n"
         "Return EXACTLY one name."
     )
 
