@@ -37,6 +37,34 @@ async def get_pool() -> aioodbc.pool.Pool:
         )
     return _pool
 
+# --- helpers for dynamic metric whitelist ---
+_NUMERIC_TYPE_TOKENS = {"int", "bigint", "decimal", "numeric", "float", "real", "smallint", "tinyint", "money", "smallmoney"}
+
+async def _load_rankable_metrics_from_csv() -> set[str]:
+    """
+    Read CSV via read_schema_csv() and return a set of numeric, available column names.
+    Assumes CSV has columns: Column_name, Datatype, Availability (Y/N or blank).
+    """
+    rows = await read_schema_csv()
+    allow: set[str] = set()
+    for r in rows:
+        col = (r.get("Column_name") or "").strip()
+        dtype = (r.get("Datatype") or "").strip().lower()
+        avail = (r.get("Availability") or "Y").strip().upper()
+        if not col or avail.startswith("N"):
+            continue
+        # crude numeric check: column's datatype string contains any numeric token
+        if any(tok in dtype for tok in _NUMERIC_TYPE_TOKENS):
+            allow.add(col)
+    return allow
+
+def _is_safe_identifier(s: str) -> bool:
+    # Defensive: ensure metric looks like a normal SQL identifier
+    # (letters/underscore start; then letters/digits/underscore)
+    import re
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", s))
+
+
 # top_metric_mssql : Get top-N metrics for a stock within a date range
 @mcp.tool()
 async def top_metric_mssql(
@@ -49,98 +77,105 @@ async def top_metric_mssql(
     latest_only: bool = False
 ) -> list[dict]:
     """
-    Return top-N rows for a given metric within a date window for one stock.
-    If latest_only=True, first lock to the latest trading day within the window,
-    then rank within that day; else rank across the whole window.
+    Return the top-N rows for a given stock and metric within a date window.
+        If latest_only = true, first lock to the latest trading day inside the window,
+        then rank on that day; otherwise rank across the whole window.
 
-    description :
-    Return the top-N rows for a given stock and metric over a date window.
-    Optionally set latest_only=true to first lock to the latest trading day inside the window, then rank on that day.
+        Dates: YYYY-MM-DD (half-open interval [start_date, end_date); end is exclusive).
 
-    Dates: YYYY-MM-DD (half-open interval [start_date, end_date); end is exclusive).
+        Workflow requirement:
+        1) Call read_schema_csv() first and obtain the 'Column_name' list.
+        2) Choose `metric` ONLY from those column names (prefer numeric columns).
+        3) Then call this tool.
 
-    Metrics:
+        Ordering: DESC (最大在前 / largest first) or ASC (最小在前 / smallest first).
 
-    txnValue = 成交金額
+        Read-only: Builds a safe SELECT against dbo.stTseStkPrcD and dbo.stScuSecuBasC.
 
-    txnShares = 成交量
+        Returns: array of rows with fields → trading_date, metric_value, stock_name, listCode.
 
-    salePrice = 收盤價
-
-    Ordering: DESC (最大在前) or ASC (最小在前).
-
-    Read-only: Internally builds a safe SELECT against dbo.stTseStkPrcD and dbo.stScuSecuBasC.
-
-    Returns an array of rows with: trading_date, metric_value, stock_name, listCode.
-
-    Parameters :
+    parameters:
     {
         "type": "object",
         "properties": {
             "stock_id": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Internal stock ID (stScuSecuBasC.id / p.stScuSecuBasC_id). Example: 9722."
+                "type": "integer",
+                "minimum": 1,
+                "description": "Internal stock ID (stScuSecuBasC.id / p.stScuSecuBasC_id). Example: 9722."
             },
             "metric": {
-            "type": "string",
-            "enum": ["txnValue", "txnShares", "salePrice"],
-            "description": "Column to rank by: txnValue=成交金額, txnShares=成交量, salePrice=收盤價."
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+                "description": "Column name to rank by. MUST be chosen from read_schema_csv().Column_name (prefer numeric columns). Do NOT invent or translate names."
             },
             "start_date": {
-            "type": "string",
-            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-            "description": "Inclusive start date (YYYY-MM-DD)."
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "description": "Inclusive start date (YYYY-MM-DD)."
             },
             "end_date": {
-            "type": "string",
-            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-            "description": "Exclusive end date (YYYY-MM-DD). Must be later than start_date."
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "description": "Exclusive end date (YYYY-MM-DD). Must be later than start_date."
             },
             "top_n": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 500,
-            "default": 1,
-            "description": "Number of rows to return after sorting."
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 1,
+                "description": "Number of rows to return after sorting."
             },
             "order_dir": {
-            "type": "string",
-            "enum": ["ASC", "DESC"],
-            "default": "DESC",
-            "description": "Sort direction for the metric (DESC = largest first)."
+                "type": "string",
+                "enum": ["ASC", "DESC"],
+                "default": "DESC",
+                "description": "Sort direction for the metric (DESC = largest first)."
             },
             "latest_only": {
-            "type": "boolean",
-            "default": false,
-            "description": "If true, first lock to the latest trading date within [start_date, end_date) for this stock, then rank on that day."
+                "type": "boolean",
+                "default": false,
+                "description": "If true, first lock to the latest trading date within [start_date, end_date) for this stock, then rank on that day."
             }
         },
         "required": ["stock_id", "metric", "start_date", "end_date"]
     }
 
-    example :
-    {
-        "stock_id": 9722,
-        "metric": "txnShares",
-        "start_date": "2025-07-01",
-        "end_date": "2025-08-01",
-        "top_n": 3,
-        "order_dir": "DESC",
-        "latest_only": false
-    }
+    examples:
+    [
+        {
+            "stock_id": 9722,
+            "metric": "txnShares",
+            "start_date": "2025-07-01",
+            "end_date": "2025-08-01",
+            "top_n": 3,
+            "order_dir": "DESC",
+            "latest_only": false
+        },
+        {
+            "stock_id": 2330,
+            "metric": "salePrice",
+            "start_date": "2025-07-15",
+            "end_date": "2025-08-01",
+            "top_n": 5,
+            "order_dir": "ASC",
+            "latest_only": true
+        }
+    ]
     
     """
-    # ---- whitelist ----
-    METRIC_MAP = {
-        "txnValue": "txnValue",
-        "txnShares": "txnShares",
-        "salePrice": "salePrice",
-        # add others you actually store
-    }
-    if metric not in METRIC_MAP:
-        raise ValueError("Unsupported metric")
-    col = METRIC_MAP[metric]
+    # --- dynamic whitelist from CSV ---
+    allowed_cols = await _load_rankable_metrics_from_csv()
+
+    if not _is_safe_identifier(metric):
+        raise ValueError("Unsupported metric: invalid identifier")
+
+    if metric not in allowed_cols:
+        # small helpful error listing the first few allowed metrics
+        sample = ", ".join(sorted(list(allowed_cols))[:12])
+        raise ValueError(f"Unsupported metric '{metric}'. Choose a numeric column from schema. e.g.: {sample} …")
+
+    # use bracket quoting to be safe with identifiers
+    col_sql = f"[{metric}]"
 
     order = "DESC" if str(order_dir).upper() == "DESC" else "ASC"
     n = int(top_n)
@@ -149,43 +184,43 @@ async def top_metric_mssql(
     if latest_only:
         sql = f"""
             WITH D AS (
-            SELECT MAX(ymdOn) AS d
-            FROM dbo.stTseStkPrcD
-            WHERE stScuSecuBasC_id = {sid}
-                AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
+                SELECT MAX(ymdOn) AS d
+                FROM dbo.stTseStkPrcD
+                WHERE stScuSecuBasC_id = {sid}
+                  AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
             )
             SELECT TOP ({n})
-            p.ymdOn AS trading_date,
-            p.{col} AS metric_value,
-            s.name  AS stock_name,
-            s.listCode
-            FROM dbo.stTseStkPrcD p
-            JOIN dbo.stScuSecuBasC s ON p.stScuSecuBasC_id = s.id
+                p.ymdOn AS trading_date,
+                p.{col_sql} AS metric_value,
+                s.name  AS stock_name,
+                s.listCode
+            FROM dbo.stTseStkPrcD AS p
+            JOIN dbo.stScuSecuBasC AS s ON p.stScuSecuBasC_id = s.id
             WHERE p.stScuSecuBasC_id = {sid}
-            AND p.ymdOn = (SELECT d FROM D)
-            ORDER BY p.{col} {order}, p.ymdOn DESC
-            """.strip()
+              AND p.ymdOn = (SELECT d FROM D)
+            ORDER BY p.{col_sql} {order}, p.ymdOn DESC
+        """.strip()
     else:
         sql = f"""
             SELECT TOP ({n})
-            p.ymdOn AS trading_date,
-            p.{col} AS metric_value,
-            s.name  AS stock_name,
-            s.listCode
-            FROM dbo.stTseStkPrcD p
-            JOIN dbo.stScuSecuBasC s ON p.stScuSecuBasC_id = s.id
+                p.ymdOn AS trading_date,
+                p.{col_sql} AS metric_value,
+                s.name  AS stock_name,
+                s.listCode
+            FROM dbo.stTseStkPrcD AS p
+            JOIN dbo.stScuSecuBasC AS s ON p.stScuSecuBasC_id = s.id
             WHERE p.stScuSecuBasC_id = {sid}
-            AND p.ymdOn >= '{start_date}' AND p.ymdOn < '{end_date}'
-            ORDER BY p.{col} {order}, p.ymdOn DESC
-            """.strip()
+              AND p.ymdOn >= '{start_date}' AND p.ymdOn < '{end_date}'
+            ORDER BY p.{col_sql} {order}, p.ymdOn DESC
+        """.strip()
 
-    # Reuse your pool + execution path (same as query_sql_mssql)
     pool = await get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(sql)
         cols = [c[0] for c in cur.description]
         rows = await cur.fetchall()
         return [dict(zip(cols, r)) for r in rows]
+
 
 
 # query_sql_mssql : input is a raw SQL string, output is a list of dicts from the result set.

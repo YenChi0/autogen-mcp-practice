@@ -69,38 +69,62 @@ async def main() -> None:
                 ID RESOLUTION
                 1) If the user mentions a company name or market id/listCode → call resolve_stock_id_mssql.
                 2) If the user mentions an industry → call resolve_stock_industry, then list_stocks_by_industry.
-                3) If a lookup has NO match → say so and suggest alternatives (e.g., "Try a different name or industry").
+                3) If the user want to query the rank of specific metric in specific period → call top_metric_mssql.
+                4) If a lookup has NO match → say so and suggest alternatives (e.g., "Try a different name or industry").
 
                 SCHEMA & COLUMNS
                 4) Before any query to dbo.stTseStkPrcD → call read_schema_csv('stTseStkPrcD_schema.csv') to know columns/units.
-                5) When querying stTseStkPrcD, filter/join by stScuSecuBasC_id (internal stock id).
-                6) If need to query the highest or lowest value of any indicator, use top_metric_mssql
-                6) Use ymdOn as the trading date column (rename here if your real column differs).
+                5) For top_metric_mssql.metric: you MUST choose the column name from the 'Column_name' list returned by read_schema_csv(). Do not guess; map the user's wording to a real column name.
+                6) Prefer numeric columns only (use Datatype in the CSV to decide). If no suitable column exists, say data is unavailable and suggest a close alternative from the CSV.
+                7) When querying stTseStkPrcD, filter/join by stScuSecuBasC_id (internal stock id).
+                8) If need to query the highest or lowest value of any indicator, use top_metric_mssql
+                9) highPrice is the highest transaction price on the trading day, lowPrice is the lowest transaction price on the trading day
+                9) Use ymdOn as the trading date column (rename here if your real column differs).
 
                 LIMITS & SAFETY
-                7) Only read queries. NEVER INSERT/UPDATE/DELETE.
-                8) DEFAULT LIMIT: TOP (100). Never return >100 rows.
-                9) Prefer TOP (N). Use OFFSET…FETCH only if strictly needed (and never mix it with TOP).
+                10) Only read queries. NEVER INSERT/UPDATE/DELETE.
+                11) DEFAULT LIMIT: TOP (100). Never return >100 rows.
+                12) Prefer TOP (N). Use OFFSET…FETCH only if strictly needed (and never mix it with TOP).
 
                 DATE WINDOWS & RANKS
-                10) If user didn’t specify a date/period and the task needs ranking (e.g., most traded, top gainers/losers):
-                    WITH D AS (SELECT MAX(ymdOn) AS d FROM dbo.stTseStkPrcD)
-                    SELECT ...
-                    FROM dbo.stTseStkPrcD AS p
-                    CROSS JOIN D
-                    WHERE p.ymdOn = D.d
-                    ORDER BY ...
-                11) Never sort an unbounded history; always limit by date or a clear window.
-                12) If the user asks for a month/year, query the FULL month/year (not a single day).
+                13) If the user didn’t specify a date/period and the task needs a ranking
+                    (e.g., most traded, top gainers/losers), DO NOT write raw SQL.
+
+                    Use the tool workflow:
+                    a) Resolve stock → resolve_stock_id_mssql (if the user gave a name/code).
+                    b) Read schema → read_schema_csv() and pick `metric` from Column_name.
+                    c) Pick a default period and call top_metric_mssql:
+
+                        • Timezone: use Asia/Taipei local date.
+                        • Default window: start_date = (today − 30 calendar days), end_date = (today + 1 day) [exclusive].
+                        • Set latest_only = true  (rank on the latest trading day inside the window).
+                        • Defaults: top_n = 10 unless the user says otherwise; order_dir = "DESC" unless specified.
+
+                    Example call (no period specified by user):
+                    top_metric_mssql(
+                        stock_id = <resolved_id>,
+                        metric = "txnShares",                # chosen from read_schema_csv().Column_name
+                        start_date = "<today_minus_30>",
+                        end_date = "<tomorrow_local>",
+                        top_n = 10,
+                        order_dir = "DESC",
+                        latest_only = True
+                    )
+
+                    If the user later specifies a period (e.g., “this week”, “2025-07-01 to 2025-08-01”):
+                    • Convert to [start_date, end_date) explicitly and set latest_only = false
+                        unless they explicitly ask for “today only”/“latest day”.
+                14) Never sort an unbounded history; always limit by date or a clear window.
+                15) If the user asks for a month/year, query the FULL month/year (not a single day).
 
                 MANY IDS
-                13) If filtering many ids, split into chunks of ≤30 and UNION ALL; apply final TOP (N) on the combined set.
+                16) If filtering many ids, split into chunks of ≤30 and UNION ALL; apply final TOP (N) on the combined set.
 
                 OUTPUT RULES
-                14) Always include stock name and its listCode from stScuSecuBasC.
-                15) Always include column UNITS from stTseStkPrcD_schema.csv.
-                16) Do NOT format the final table/answer—leave that to the Reporter.
-                17) If data is unavailable, say so and suggest an alternative metric.
+                17) Always include stock name and its listCode from stScuSecuBasC.
+                18) Always include column UNITS from stTseStkPrcD_schema.csv.
+                19) Do NOT format the final table/answer—leave that to the Reporter.
+                20) If data is unavailable, say so and suggest an alternative metric.
 
             """
             ),
