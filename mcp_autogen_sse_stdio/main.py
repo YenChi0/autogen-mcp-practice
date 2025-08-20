@@ -121,6 +121,23 @@ async def main() -> None:
         description="Does small arithmetic when requested.",
     )
 
+    fallback_agent = AssistantAgent(
+        name="Fallback",
+        model_client=model_client,
+        tools=[],
+        reflect_on_tool_use=False,
+        model_client_stream=True,
+        system_message=(
+            "You are Fallback. When selected you must do exactly ONE of:\n"
+            "• If the user message is a greeting → reply with a short greeting.\n"
+            "• If the user asks for something unrelated to Taiwanese stocks/SQL/math → "
+            "politely say the system cannot help and suggest a topic it CAN handle.\n"
+            "End your message with the word TERMINATE."
+        ),
+        description="Politely declines or greets for out-of-domain queries."
+    )
+
+
     # 4) Final output agent: formats the one-shot answer only.
     reporter = AssistantAgent(
         name="Reporter",
@@ -146,25 +163,31 @@ async def main() -> None:
     )
 
     # ---------- Team (SelectorGroupChat) ----------
-    selector_prompt = (
-        "You are the team selector. Roles:\n"
-        "{roles}\n\n"
-        "Conversation so far:\n"
-        "{history}\n\n"
-        "Select an agent from: {participants}\n\n"
-        "Following is the rule to choose an agent:\n"
-        "- When the task involves Taiwanese stocks, Market stocks, Industry stocks or SQL, prefer MSSQL_Agent.\n"
-        "- Choose MSSQL_Agent for stock id resolution, schema inspection, and SQL queries.\n"
-        "- Choose Math_Agent only when explicit arithmetic is needed.\n"
-        "- Select 'User' if the assistant message includes 'REQUEST_USER_INPUT'.\n"
-        "- Avoid unnecessary switching; allow the same speaker to continue if still working.\n"
-        "Please give more time to search because there is a lot of information in mssql.\n"
-        "Always include stock name in the output and its list code from stScuSecuBasC.\n"
-        "Return EXACTLY one name."
-    )
+    selector_prompt = """
+            You are the team selector. Roles:
+            {roles}
+
+            Conversation so far:
+            {history}
+
+            Select an agent from: {participants}
+
+            Following is the rule to choose an agent:
+            - If the user message is a greeting, small talk, or clearly NOT about Taiwanese stocks, SQL, arithmetic, or reporting → select Fallback.
+            - If the agent that is currently speaking already asked the user for clarification, select 'User'.
+            - When the task involves Taiwanese stocks, Market stocks, Industry stocks or SQL, prefer MSSQL_Agent.
+            - Choose MSSQL_Agent for stock id resolution, schema inspection, and SQL queries.
+            - Choose Math_Agent only when explicit arithmetic is needed.
+            - Select 'User' if the assistant message includes 'REQUEST_USER_INPUT'.
+            - Avoid unnecessary switching; allow the same speaker to continue if still working.
+            Please give more time to search because there is a lot of information in mssql.
+            Always include stock name in the output and its list code from stScuSecuBasC.
+            Return EXACTLY one name.
+        """
+
 
     team = SelectorGroupChat(
-        participants=[user_agent, mssql_agent, math_agent, reporter],
+        participants=[user_agent, mssql_agent, math_agent, reporter, fallback_agent],
         model_client=model_client,
         termination_condition=TextMentionTermination("TERMINATE"),
         selector_prompt=selector_prompt,

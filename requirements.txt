@@ -1,0 +1,6 @@
+aioodbc
+mcp
+autogen
+openai
+autogen_agentchat
+autogen_ext
