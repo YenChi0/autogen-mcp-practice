@@ -65,6 +65,204 @@ def _is_safe_identifier(s: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", s))
 
 
+from typing import Any, Dict, List
+
+@mcp.tool()
+async def price_change_mssql(
+    stock_id: int,
+    start_date: str,
+    end_date: str,
+    include_series: bool = False,
+    baseline: str = "prev_close",         # "in_window" or "prev_close"
+    price_basis: str = "close"           # close|open|high|low|hl2|hlc3|ohlc4|wclose
+) -> Dict[str, Any]:
+    """
+    Compute price change for a given stock over [start_date, end_date) (absolute and percent),
+    supporting different price bases and baseline choices.
+
+    Price basis (price_basis) mapping:
+      close  -> [salePrice]
+      open   -> [openPrice]
+      high   -> [highPrice]
+      low    -> [lowPrice]
+      hl2    -> ([highPrice]+[lowPrice]) / 2.0
+      hlc3   -> ([highPrice]+[lowPrice]+[salePrice]) / 3.0
+      ohlc4  -> ([openPrice]+[highPrice]+[lowPrice]+[salePrice]) / 4.0
+      wclose -> ([highPrice]+[lowPrice]+2.0*[salePrice]) / 4.0
+
+    Baseline (baseline):
+      - "in_window": use the first available trading day inside the window as the start,
+                     and the last available trading day inside the window as the end.
+      - "prev_close": use the most recent trading day BEFORE start_date as the start,
+                      and the last available trading day inside the window as the end.
+                      (e.g., "July return = July month-end vs June month-end")
+
+    Return example:
+      {
+        "stock_id": <int>,
+        "price_basis": "<str>",
+        "baseline": "<str>",
+        "start_date": "YYYY-MM-DD",
+        "end_date": "YYYY-MM-DD",
+        "first_date": "YYYY-MM-DD" | None,
+        "first_price": <float> | None,
+        "last_date": "YYYY-MM-DD" | None,
+        "last_price": <float> | None,
+        "abs_change": <float> | None,      # last_price - first_price
+        "pct_change": <float> | None,      # (last - first) / first
+        "series": [{"date":"YYYY-MM-DD","price":<float>}, ...] | None  # only when include_series=True
+      }
+
+    Notes:
+      - end_date is exclusive; e.g., for July use start_date='YYYY-07-01', end_date='YYYY-08-01'.
+      - If either endpoint is missing (no data), abs_change/pct_change will be None.
+    """
+
+    # Allowed baselines and basis expressions
+    BASELINES = {"in_window", "prev_close"}
+    BASIS_SQL = {
+        "close":  "[closePrice]",
+        "open":   "[openPrice]",
+        "high":   "[highPrice]",
+        "low":    "[lowPrice]",
+        "hl2":    "([highPrice]+[lowPrice]) / 2.0",   # HL2（中間價）
+        "hlc3":   "([highPrice]+[lowPrice]+[colsePrice]) / 3.0",   # HLC3（典型價）
+        "ohlc4":  "([openPrice]+[highPrice]+[lowPrice]+[colsePrice]) / 4.0", # OHLC4（均價）
+        "wclose": "([highPrice]+[lowPrice]+2.0*[colsePrice]) / 4.0", # 加權收盤（WCL）
+    }
+
+    b = (baseline or "in_window").lower()
+    if b not in BASELINES:
+        raise ValueError(f"Unsupported baseline '{baseline}'. Use one of: {', '.join(sorted(BASELINES))}")
+
+    pb = (price_basis or "close").lower()
+    if pb not in BASIS_SQL:
+        raise ValueError(f"Unsupported price_basis '{price_basis}'. Use one of: {', '.join(BASIS_SQL.keys())}")
+
+    expr = BASIS_SQL[pb]
+    sid = int(stock_id)
+
+    # Build SQL based on baseline
+    if b == "prev_close":
+        # Start: the most recent trading day before start_date
+        # End:   the last trading day inside [start_date, end_date)
+        summary_sql = f"""
+            WITH W AS (
+                SELECT ymdOn, {expr} AS price
+                FROM dbo.stTseStkPrcD
+                WHERE stScuSecuBasC_id = {sid}
+                  AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
+                  AND {expr} IS NOT NULL
+            ),
+            P0 AS (
+                SELECT TOP (1) ymdOn AS first_date, {expr} AS first_price
+                FROM dbo.stTseStkPrcD
+                WHERE stScuSecuBasC_id = {sid}
+                  AND ymdOn < '{start_date}'
+                  AND {expr} IS NOT NULL
+                ORDER BY ymdOn DESC
+            ),
+            L AS (
+                SELECT TOP (1) ymdOn AS last_date, price AS last_price
+                FROM W ORDER BY ymdOn DESC
+            )
+            SELECT
+                P0.first_date,
+                P0.first_price,
+                L.last_date,
+                L.last_price,
+                CASE WHEN P0.first_price IS NULL OR L.last_price IS NULL THEN NULL
+                     ELSE L.last_price - P0.first_price END AS abs_change,
+                CASE WHEN P0.first_price IS NULL OR P0.first_price = 0 OR L.last_price IS NULL THEN NULL
+                     ELSE (L.last_price - P0.first_price) / P0.first_price END AS pct_change
+            FROM P0 CROSS JOIN L;
+        """.strip()
+    else:
+        # in_window: first/last trading day inside the window
+        summary_sql = f"""
+            WITH W AS (
+                SELECT ymdOn, {expr} AS price
+                FROM dbo.stTseStkPrcD
+                WHERE stScuSecuBasC_id = {sid}
+                  AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
+                  AND {expr} IS NOT NULL
+            ),
+            F AS (
+                SELECT TOP (1) ymdOn AS first_date, price AS first_price
+                FROM W ORDER BY ymdOn ASC
+            ),
+            L AS (
+                SELECT TOP (1) ymdOn AS last_date, price AS last_price
+                FROM W ORDER BY ymdOn DESC
+            )
+            SELECT
+                F.first_date,
+                F.first_price,
+                L.last_date,
+                L.last_price,
+                CASE WHEN F.first_price IS NULL OR L.last_price IS NULL THEN NULL
+                     ELSE L.last_price - F.first_price END AS abs_change,
+                CASE WHEN F.first_price IS NULL OR F.first_price = 0 OR L.last_price IS NULL THEN NULL
+                     ELSE (L.last_price - F.first_price) / F.first_price END AS pct_change
+            FROM F CROSS JOIN L;
+        """.strip()
+
+    # Execute summary query
+    pool = await get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(summary_sql)
+        row = await cur.fetchone()
+        if not row:
+            result: Dict[str, Any] = {
+                "stock_id": sid,
+                "price_basis": pb,
+                "baseline": b,
+                "start_date": start_date,
+                "end_date": end_date,
+                "first_date": None,
+                "first_price": None,
+                "last_date": None,
+                "last_price": None,
+                "abs_change": None,
+                "pct_change": None,
+                "series": [] if include_series else None
+            }
+            return result
+
+        cols_summary = [c[0] for c in cur.description]
+        summary = dict(zip(cols_summary, row))
+
+    # Assemble result
+    result: Dict[str, Any] = {
+        "stock_id": sid,
+        "price_basis": pb,
+        "baseline": b,
+        "start_date": start_date,
+        "end_date": end_date,
+        **summary
+    }
+
+    # Optional daily series inside the window (same price_basis)
+    if include_series:
+        series_sql = f"""
+            SELECT ymdOn AS [date], {expr} AS price
+            FROM dbo.stTseStkPrcD
+            WHERE stScuSecuBasC_id = {sid}
+              AND ymdOn >= '{start_date}' AND ymdOn < '{end_date}'
+              AND {expr} IS NOT NULL
+            ORDER BY ymdOn ASC;
+        """.strip()
+        async with pool.acquire() as conn2, conn2.cursor() as cur2:
+            await cur2.execute(series_sql)
+            rows = await cur2.fetchall()
+            cols_series = [c[0] for c in cur2.description]
+            result["series"] = [dict(zip(cols_series, r)) for r in rows]
+    else:
+        result["series"] = None
+
+    return result
+
+
 # top_metric_mssql : Get top-N metrics for a stock within a date range
 @mcp.tool()
 async def top_metric_mssql(
@@ -161,7 +359,7 @@ async def top_metric_mssql(
             "latest_only": true
         }
     ]
-    
+
     """
     # --- dynamic whitelist from CSV ---
     allowed_cols = await _load_rankable_metrics_from_csv()
@@ -605,11 +803,6 @@ async def list_stocks_by_industry(industry_id: int) -> list[int]:
 
 
 # ── BOOT ──────────────────────────────────────────────────────────────
-async def run() -> None:
-    """Entry-point used by  python -m mssqlserver  (stdio)"""
-    await mcp.run_stdio_async()          # FastMCP handles JSON-RPC loop
-
-
 async def main():
     # single line — FastMCP handles stdio internally
     await mcp.run_stdio_async()
