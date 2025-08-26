@@ -19,14 +19,27 @@ class MenuRow(TypedDict):
     price: float
 
 @mcp.tool()
-def show_menu_list() -> str:
+def show_menu_list() -> List[MenuRow]:
     """
-    Return the menu as ONE raw JSON array string (not a Python list),
-    so the framework won't split it into multiple chunks.
-    Example: [{"item":"魯肉便當","price":80.0}, ...]
+    Return the menu as a JSON array of objects (NOT wrapped in a dict).
+
+    Returns
+    -------
+    list[dict]
+        [
+          {"item": "魯肉便當", "price": 80.0},
+          {"item": "雞絲便當", "price": 90.0},
+          {"item": "排骨便當", "price": 110.0},
+          {"item": "雞排便當", "price": 120.0},
+          {"item": "雙拼便當", "price": 250.0}
+        ]
+
+    Notes
+    -----
+    - Use EXACT item names from CSV; do not normalize/rename.
+    - Prices are numbers (float). Keep the original row order from CSV.
     """
-    arr = [{"item": name, "price": float(price)} for name, price in MENU.items()]
-    return json.dumps(arr, ensure_ascii=False)
+    return [{"item": name, "price": float(price)} for name, price in MENU.items()]
 
 class OrderItem(TypedDict):
     item: str
